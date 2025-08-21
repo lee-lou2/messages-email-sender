@@ -1,0 +1,17 @@
+[package]
+name = "messages-email-sender"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+futures = "0.3.31"
+serde = { version = "1.0.219", features = ["derive"] }
+tracing = "0.1.41"
+anyhow = "1.0.99"
+serde_json = "1.0.142"
+tokio = { version = "1.47.1", features = ["full"] }
+tracing-subscriber = "0.3.19"
+async-nats = "0.42.0"
+aws-config = "1.8.5"
+aws-sdk-sesv2 = "1.93.0"
+moka = { version = "0.12.10", features = ["future"] }
