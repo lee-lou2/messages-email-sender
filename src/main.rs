@@ -1,5 +1,6 @@
 use std::env;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use async_nats::jetstream::consumer::pull::Config as PullConfig;
@@ -180,6 +181,7 @@ async fn email_sender(
     ses_client: Arc<SesClient>,
     rate_limiter: RateLimiter,
     config: Arc<AppConfig>,
+    sent_count: Arc<AtomicUsize>,
 ) -> anyhow::Result<()> {
     info!("Sender task started. Rate: {}/sec", config.ses_rate_per_sec);
 
@@ -199,6 +201,7 @@ async fn email_sender(
             msg,
             Arc::clone(&config),
             permit,
+            Arc::clone(&sent_count),
         ));
     }
 
@@ -212,6 +215,7 @@ async fn send_single_email(
     msg: ProcessableMessage,
     config: Arc<AppConfig>,
     _permit: OwnedSemaphorePermit, // permit의 소유권을 가져와 작업이 끝날 때까지 토큰을 유지
+    sent_count: Arc<AtomicUsize>,
 ) {
     let start = Instant::now();
     let payload = msg.payload;
@@ -241,6 +245,8 @@ async fn send_single_email(
         .await
     {
         Ok(_) => {
+            // 성공 시 카운터 증가
+            sent_count.fetch_add(1, Ordering::Relaxed);
             debug!("Email sent to {} in {:?}", payload.email, start.elapsed());
             // 성공 시 NATS 메시지 ACK
             if let Err(e) = nats_msg.ack().await {
@@ -314,6 +320,21 @@ async fn main() -> anyhow::Result<()> {
     // 생산자와 소비자 간의 통신을 위한 MPSC 채널 생성
     let (tx, rx) = mpsc::channel(config.channel_capacity);
 
+    // 초당 발송 카운터 및 로깅 태스크 추가
+    let sent_count = Arc::new(AtomicUsize::new(0));
+    let sent_count_logger = Arc::clone(&sent_count);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            // 카운터 값을 0으로 교체하며 이전 값을 가져옴
+            let count = sent_count_logger.swap(0, Ordering::Relaxed);
+            if count > 0 {
+                info!("Sent {} emails/sec", count);
+            }
+        }
+    });
+
     // 생산자(fetcher)와 소비자(sender) 태스크 실행
     let fetcher = tokio::spawn(fetch_and_dispatch(
         consumer,
@@ -321,7 +342,13 @@ async fn main() -> anyhow::Result<()> {
         idempotent_cache,
         Arc::clone(&config),
     ));
-    let sender = tokio::spawn(email_sender(rx, ses_client, rate_limiter, config));
+    let sender = tokio::spawn(email_sender(
+        rx,
+        ses_client,
+        rate_limiter,
+        config,
+        sent_count,
+    ));
 
     info!("All tasks started successfully");
 
