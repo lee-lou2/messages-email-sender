@@ -11,8 +11,7 @@ use futures::StreamExt;
 use moka::future::Cache;
 use serde::Deserialize;
 use tokio::sync::mpsc::{self, Receiver, Sender};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use aws_config::BehaviorVersion;
 use aws_config::meta::region::RegionProviderChain;
@@ -35,7 +34,7 @@ struct AppConfig {
     stream_name: String,
     subject_filter: String,
     durable_name: String,
-    ses_rate_per_sec: usize,
+    ses_rate_per_sec: u64,
     from_email: String,
     channel_capacity: usize,
     max_ack_pending: i64,
@@ -78,40 +77,6 @@ impl AppConfig {
                 .parse()
                 .unwrap_or(200),
         }
-    }
-}
-
-// 토큰 버킷 알고리즘을 사용한 속도 제한기
-#[derive(Clone)]
-struct RateLimiter {
-    semaphore: Arc<Semaphore>,
-}
-
-impl RateLimiter {
-    fn new(rate_per_sec: usize) -> Self {
-        Self {
-            semaphore: Arc::new(Semaphore::new(rate_per_sec)),
-        }
-    }
-
-    async fn acquire_permit(&self) -> Result<OwnedSemaphorePermit, tokio::sync::AcquireError> {
-        self.semaphore.clone().acquire_owned().await
-    }
-
-    // 1초마다 토큰을 리필하는 백그라운드 태스크 실행
-    fn spawn_refill_task(&self, rate_per_sec: usize) {
-        let semaphore = Arc::clone(&self.semaphore);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(1));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                interval.tick().await;
-                let current = semaphore.available_permits();
-                if current < rate_per_sec {
-                    semaphore.add_permits(rate_per_sec - current);
-                }
-            }
-        });
     }
 }
 
@@ -175,37 +140,44 @@ async fn fetch_and_dispatch(
     }
 }
 
-// 채널에서 메시지를 받아 이메일 발송 (소비자)
-async fn email_sender(
+async fn rate_limited_sender(
     mut rx: Receiver<ProcessableMessage>,
     ses_client: Arc<SesClient>,
-    rate_limiter: RateLimiter,
     config: Arc<AppConfig>,
     sent_count: Arc<AtomicUsize>,
 ) -> anyhow::Result<()> {
-    info!("Sender task started. Rate: {}/sec", config.ses_rate_per_sec);
+    info!(
+        "Rate limited sender started. Rate: {}/sec",
+        config.ses_rate_per_sec
+    );
 
-    while let Some(msg) = rx.recv().await {
-        // 속도 제한에 따라 허용될 때까지 대기
-        let permit = match rate_limiter.acquire_permit().await {
-            Ok(p) => p,
-            Err(_) => {
-                error!("Rate limiter semaphore closed. Shutting down sender.");
-                break;
-            }
-        };
-
-        // 각 이메일 발송을 별도의 태스크로 분리하여 병렬 처리
-        tokio::spawn(send_single_email(
-            Arc::clone(&ses_client),
-            msg,
-            Arc::clone(&config),
-            permit,
-            Arc::clone(&sent_count),
-        ));
+    if config.ses_rate_per_sec == 0 {
+        warn!("SES_RATE_PER_SEC is 0, sender will not process any messages.");
+        return Ok(());
     }
 
-    info!("Channel closed. Shutting down sender task.");
+    // 1초를 설정된 발송량으로 나누어 처리 간격을 계산
+    let interval_duration = Duration::from_micros(1_000_000 / config.ses_rate_per_sec);
+    let mut interval = tokio::time::interval(interval_duration);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
+
+    loop {
+        interval.tick().await;
+
+        // 채널에서 메시지를 하나 가져옴 (메시지가 올 때까지 대기)
+        if let Some(msg) = rx.recv().await {
+            tokio::spawn(send_single_email(
+                Arc::clone(&ses_client),
+                msg,
+                Arc::clone(&config),
+                Arc::clone(&sent_count),
+            ));
+        } else {
+            // 채널이 닫혔으면 태스크 종료
+            info!("Message channel closed. Shutting down sender task.");
+            break;
+        }
+    }
     Ok(())
 }
 
@@ -214,7 +186,6 @@ async fn send_single_email(
     ses_client: Arc<SesClient>,
     msg: ProcessableMessage,
     config: Arc<AppConfig>,
-    _permit: OwnedSemaphorePermit, // permit의 소유권을 가져와 작업이 끝날 때까지 토큰을 유지
     sent_count: Arc<AtomicUsize>,
 ) {
     let start = Instant::now();
@@ -282,7 +253,7 @@ async fn main() -> anyhow::Result<()> {
         .await;
     let ses_client = Arc::new(SesClient::new(&aws_config));
 
-    // NATS Jetstream 연결 및 스트림/소비자 설정
+    // NATS Jet Stream 연결 및 스트림/소비자 설정
     let client = async_nats::connect(&config.nats_url).await?;
     let js = jetstream::new(client);
     let stream = js
@@ -313,10 +284,6 @@ async fn main() -> anyhow::Result<()> {
             .build(),
     );
 
-    // 속도 제한기 초기화 및 토큰 리필 태스크 시작
-    let rate_limiter = RateLimiter::new(config.ses_rate_per_sec);
-    rate_limiter.spawn_refill_task(config.ses_rate_per_sec);
-
     // 생산자와 소비자 간의 통신을 위한 MPSC 채널 생성
     let (tx, rx) = mpsc::channel(config.channel_capacity);
 
@@ -342,13 +309,8 @@ async fn main() -> anyhow::Result<()> {
         idempotent_cache,
         Arc::clone(&config),
     ));
-    let sender = tokio::spawn(email_sender(
-        rx,
-        ses_client,
-        rate_limiter,
-        config,
-        sent_count,
-    ));
+
+    let sender = tokio::spawn(rate_limited_sender(rx, ses_client, config, sent_count));
 
     info!("All tasks started successfully");
 
