@@ -159,7 +159,7 @@ async fn rate_limited_sender(
     // 1초를 설정된 발송량으로 나누어 처리 간격을 계산
     let interval_duration = Duration::from_micros(1_000_000 / config.ses_rate_per_sec);
     let mut interval = tokio::time::interval(interval_duration);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         interval.tick().await;
