@@ -1,17 +1,18 @@
 use std::env;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use async_nats::jetstream::consumer::pull::Config as PullConfig;
-use async_nats::jetstream::consumer::{AckPolicy, Consumer};
+use async_nats::jetstream;
+use async_nats::jetstream::consumer::{AckPolicy, Consumer, pull::Config as PullConfig};
 use async_nats::jetstream::message::{AckKind, Message};
-use async_nats::jetstream::{self, stream::Config as StreamConfig};
+use async_nats::jetstream::stream::Config as StreamConfig;
 use futures::StreamExt;
+use governor::{Quota, RateLimiter};
 use moka::future::Cache;
 use serde::Deserialize;
-use tokio::sync::mpsc::{self, Receiver, Sender};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 use aws_config::BehaviorVersion;
 use aws_config::meta::region::RegionProviderChain;
@@ -36,11 +37,7 @@ struct AppConfig {
     durable_name: String,
     ses_rate_per_sec: u64,
     from_email: String,
-    channel_capacity: usize,
-    max_ack_pending: i64,
-    nak_delay_secs: u64,
-    idempotency_window_secs: u64,
-    fetch_batch_size: usize,
+    concurrency_limit: usize,
 }
 
 impl AppConfig {
@@ -56,142 +53,23 @@ impl AppConfig {
                 .parse()
                 .unwrap_or(50),
             from_email: env::var("FROM_EMAIL").unwrap_or_else(|_| "no-reply@localhost".to_string()),
-            channel_capacity: env::var("CHANNEL_CAPACITY")
-                .unwrap_or_else(|_| "5000".to_string())
+            concurrency_limit: env::var("CONCURRENCY_LIMIT")
+                .unwrap_or_else(|_| "500".to_string())
                 .parse()
-                .unwrap_or(5000),
-            max_ack_pending: env::var("MAX_ACK_PENDING")
-                .unwrap_or_else(|_| "1000".to_string())
-                .parse()
-                .unwrap_or(1000),
-            nak_delay_secs: env::var("NAK_DELAY_SECS")
-                .unwrap_or_else(|_| "10".to_string())
-                .parse()
-                .unwrap_or(10),
-            idempotency_window_secs: env::var("IDEMPOTENCY_WINDOW_SECS")
-                .unwrap_or_else(|_| "60".to_string())
-                .parse()
-                .unwrap_or(60),
-            fetch_batch_size: env::var("FETCH_BATCH_SIZE")
-                .unwrap_or_else(|_| "200".to_string())
-                .parse()
-                .unwrap_or(200),
+                .unwrap_or(500),
         }
     }
 }
 
-// NATS 메시지와 파싱된 페이로드를 함께 관리하는 구조체
-struct ProcessableMessage {
-    payload: EmailPayload,
-    nats_msg: Message,
-}
-
-// NATS에서 메시지를 가져와 채널로 전송 (생산자)
-async fn fetch_and_dispatch(
-    consumer: Consumer<PullConfig>,
-    tx: Sender<ProcessableMessage>,
-    idempotent_cache: Arc<Cache<String, ()>>,
-    config: Arc<AppConfig>,
-) -> anyhow::Result<()> {
-    info!(
-        "Fetcher task started. Fetch batch size: {}",
-        config.fetch_batch_size
-    );
-    loop {
-        let batch_result = consumer
-            .fetch()
-            .max_messages(config.fetch_batch_size)
-            .expires(Duration::from_secs(5))
-            .messages()
-            .await;
-        match batch_result {
-            Ok(mut batch) => {
-                while let Some(Ok(msg)) = batch.next().await {
-                    match serde_json::from_slice::<EmailPayload>(&msg.payload) {
-                        Ok(payload) => {
-                            // 멱등성 보장을 위해 이미 처리된 메시지인지 확인
-                            if idempotent_cache.get(&payload.uuid).await.is_some() {
-                                let _ = msg.ack().await;
-                                continue;
-                            }
-                            idempotent_cache.insert(payload.uuid.clone(), ()).await;
-                            let processable = ProcessableMessage {
-                                payload,
-                                nats_msg: msg,
-                            };
-                            if tx.send(processable).await.is_err() {
-                                error!("Channel closed, shutting down fetcher");
-                                return Ok(());
-                            }
-                        }
-                        Err(e) => {
-                            // 잘못된 형식의 메시지(Poison Pill)는 ACK 처리하여 제거
-                            debug!("Invalid message format (poison pill): {}", e);
-                            let _ = msg.ack().await;
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                error!("Failed to fetch messages: {}", e);
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        }
-    }
-}
-
-async fn rate_limited_sender(
-    mut rx: Receiver<ProcessableMessage>,
-    ses_client: Arc<SesClient>,
-    config: Arc<AppConfig>,
-    sent_count: Arc<AtomicUsize>,
-) -> anyhow::Result<()> {
-    info!(
-        "Rate limited sender started. Rate: {}/sec",
-        config.ses_rate_per_sec
-    );
-
-    if config.ses_rate_per_sec == 0 {
-        warn!("SES_RATE_PER_SEC is 0, sender will not process any messages.");
-        return Ok(());
-    }
-
-    // 1초를 설정된 발송량으로 나누어 처리 간격을 계산
-    let interval_duration = Duration::from_micros(1_000_000 / config.ses_rate_per_sec);
-    let mut interval = tokio::time::interval(interval_duration);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    loop {
-        interval.tick().await;
-
-        // 채널에서 메시지를 하나 가져옴 (메시지가 올 때까지 대기)
-        if let Some(msg) = rx.recv().await {
-            tokio::spawn(send_single_email(
-                Arc::clone(&ses_client),
-                msg,
-                Arc::clone(&config),
-                Arc::clone(&sent_count),
-            ));
-        } else {
-            // 채널이 닫혔으면 태스크 종료
-            info!("Message channel closed. Shutting down sender task.");
-            break;
-        }
-    }
-    Ok(())
-}
-
-// 개별 이메일을 AWS SES를 통해 발송
+// 개별 이메일을 AWS SES를 통해 발송하는 로직 (기존과 거의 동일)
 async fn send_single_email(
     ses_client: Arc<SesClient>,
-    msg: ProcessableMessage,
+    nats_msg: Message,
+    payload: EmailPayload,
     config: Arc<AppConfig>,
     sent_count: Arc<AtomicUsize>,
 ) {
-    let start = Instant::now();
-    let payload = msg.payload;
-    let nats_msg = msg.nats_msg;
-
+    // SES 메시지 구성
     let destination = Destination::builder().to_addresses(&payload.email).build();
     let subject = Content::builder()
         .data(&payload.subject)
@@ -207,6 +85,7 @@ async fn send_single_email(
     let ses_message = SesMessage::builder().subject(subject).body(body).build();
     let email_content = EmailContent::builder().simple(ses_message).build();
 
+    // 이메일 발송
     match ses_client
         .send_email()
         .from_email_address(&config.from_email)
@@ -216,24 +95,19 @@ async fn send_single_email(
         .await
     {
         Ok(_) => {
-            // 성공 시 카운터 증가
             sent_count.fetch_add(1, Ordering::Relaxed);
-            debug!("Email sent to {} in {:?}", payload.email, start.elapsed());
-            // 성공 시 NATS 메시지 ACK
+            debug!("Email sent to {}", payload.email);
             if let Err(e) = nats_msg.ack().await {
-                error!("Failed to ACK message for {}: {}", payload.email, e);
+                error!("메시지 ACK 실패 ({}): {}", payload.email, e);
             }
         }
         Err(e) => {
-            error!("Failed to send email to {}: {}", payload.email, e);
-            // 실패 시 NATS 메시지 NAK (재시도 요청)
+            error!("이메일 발송 실패 ({}): {}", payload.email, e);
             if let Err(e) = nats_msg
-                .ack_with(AckKind::Nak(Some(Duration::from_secs(
-                    config.nak_delay_secs,
-                ))))
+                .ack_with(AckKind::Nak(Some(Duration::from_secs(5))))
                 .await
             {
-                error!("Failed to NAK message for {}: {}", payload.email, e);
+                error!("메시지 NAK 실패 ({}): {}", payload.email, e);
             }
         }
     }
@@ -243,9 +117,9 @@ async fn send_single_email(
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let config = Arc::new(AppConfig::from_env());
-    info!("Starting email processor with config: {:?}", config);
+    info!("이메일 프로세서 시작. 설정: {:?}", config);
 
-    // AWS SDK 클라이언트 초기화
+    // AWS SDK 클라이언트 설정
     let region_provider = RegionProviderChain::default_provider().or_else("ap-northeast-2");
     let aws_config = aws_config::defaults(BehaviorVersion::latest())
         .region(region_provider)
@@ -253,17 +127,16 @@ async fn main() -> anyhow::Result<()> {
         .await;
     let ses_client = Arc::new(SesClient::new(&aws_config));
 
-    // NATS Jet Stream 연결 및 스트림/소비자 설정
+    // NATS JetStream 설정
     let client = async_nats::connect(&config.nats_url).await?;
-    let js = jetstream::new(client);
-    let stream = js
+    let stream = jetstream::new(client)
         .get_or_create_stream(StreamConfig {
             name: config.stream_name.clone(),
             subjects: vec![format!("{}.*", config.stream_name)],
             ..Default::default()
         })
         .await?;
-    let consumer = stream
+    let consumer: Consumer<PullConfig> = stream
         .get_or_create_consumer(
             &config.durable_name,
             PullConfig {
@@ -271,56 +144,99 @@ async fn main() -> anyhow::Result<()> {
                 filter_subject: config.subject_filter.clone(),
                 ack_policy: AckPolicy::Explicit,
                 ack_wait: Duration::from_secs(30),
-                max_ack_pending: config.max_ack_pending,
+                max_ack_pending: (config.concurrency_limit * 2) as i64,
                 ..Default::default()
             },
         )
         .await?;
 
-    // 멱등성 보장을 위한 캐시 초기화
+    // 멱등성 캐시 설정
     let idempotent_cache = Arc::new(
         Cache::builder()
-            .time_to_live(Duration::from_secs(config.idempotency_window_secs))
+            .time_to_live(Duration::from_secs(60))
             .build(),
     );
 
-    // 생산자와 소비자 간의 통신을 위한 MPSC 채널 생성
-    let (tx, rx) = mpsc::channel(config.channel_capacity);
-
-    // 초당 발송 카운터 및 로깅 태스크 추가
+    // 초당 발송 카운터 및 로깅 태스크
     let sent_count = Arc::new(AtomicUsize::new(0));
     let sent_count_logger = Arc::clone(&sent_count);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         loop {
             interval.tick().await;
-            // 카운터 값을 0으로 교체하며 이전 값을 가져옴
             let count = sent_count_logger.swap(0, Ordering::Relaxed);
             if count > 0 {
-                info!("Sent {} emails/sec", count);
+                info!("🚀 Sent per second (RPS): {}", count);
             }
         }
     });
 
-    // 생산자(fetcher)와 소비자(sender) 태스크 실행
-    let fetcher = tokio::spawn(fetch_and_dispatch(
-        consumer,
-        tx,
-        idempotent_cache,
-        Arc::clone(&config),
-    ));
+    // Rate Limiter 설정
+    let rate_limiter = Arc::new(RateLimiter::direct(Quota::per_second(
+        NonZeroU32::new(config.ses_rate_per_sec as u32).unwrap_or(NonZeroU32::new(1).unwrap()),
+    )));
 
-    let sender = tokio::spawn(rate_limited_sender(rx, ses_client, config, sent_count));
+    info!(
+        "NATS JetStream에서 메시지 컨슈밍 시작... (동시성: {}, 비율: {} RPS)",
+        config.concurrency_limit, config.ses_rate_per_sec
+    );
 
-    info!("All tasks started successfully");
+    loop {
+        // 메시지 컨슈밍
+        let messages = consumer
+            .fetch()
+            .max_messages(config.concurrency_limit)
+            .messages()
+            .await?;
 
-    // 종료 신호(Ctrl+C) 또는 태스크 종료 대기
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => { info!("Received shutdown signal"); }
-        res = fetcher => { error!("Fetcher task ended: {:?}", res); }
-        res = sender => { error!("Sender task ended: {:?}", res); }
+        messages
+            .for_each_concurrent(config.concurrency_limit, |message_result| {
+                let limiter = Arc::clone(&rate_limiter);
+                let client = Arc::clone(&ses_client);
+                let conf = Arc::clone(&config);
+                let counter = Arc::clone(&sent_count);
+                let cache = Arc::clone(&idempotent_cache);
+
+                async move {
+                    let nats_msg = match message_result {
+                        Ok(msg) => msg,
+                        Err(e) => {
+                            error!("NATS 메시지 수신 실패: {}", e);
+                            return;
+                        }
+                    };
+
+                    // 메시지 파싱
+                    let payload: EmailPayload = match rmp_serde::from_slice(&nats_msg.payload) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            debug!(
+                                "잘못된 형식의 메시지(Poison Pill): {}. 메시지를 ACK 처리합니다.",
+                                e
+                            );
+                            let _ = nats_msg.ack().await;
+                            return;
+                        }
+                    };
+
+                    // 멱등성 체크
+                    if cache.get(&payload.uuid).await.is_some() {
+                        debug!(
+                            "중복된 메시지 수신 (UUID: {}), ACK 처리합니다.",
+                            payload.uuid
+                        );
+                        let _ = nats_msg.ack().await;
+                        return;
+                    }
+                    cache.insert(payload.uuid.clone(), ()).await;
+
+                    // 초당 발송 수 고려하여 대기
+                    limiter.until_ready().await;
+
+                    // 메시지 발송
+                    tokio::spawn(send_single_email(client, nats_msg, payload, conf, counter));
+                }
+            })
+            .await;
     }
-
-    info!("Shutdown complete");
-    Ok(())
 }

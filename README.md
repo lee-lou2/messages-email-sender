@@ -1,156 +1,139 @@
-# Email Sender (Messages Module)
+# Email Sender Service
 
-이 저장소는 메시징 시스템인 `messages`의 이메일 발송 전용 MSA입니다.  
-NATS JetStream에서 이메일 요청 메시지를 Pull 소비하여 AWS SES로 발송합니다. 고가용성과 멱등성, 배치·재시도, 속도 제한을 고려한 경량 러스트 서비스입니다.
+고성능 이메일 발송 마이크로서비스입니다. NATS JetStream에서 메시지를 소비하여 AWS SES를 통해 이메일을 발송합니다.
 
-## 핵심 기능
+## 주요 특징
 
-- __NATS JetStream Pull Consumer__: `STREAM`/`SUBJECT`로 필터링된 메시지 소비
-- __배치 처리 + 속도 제한__: 초당 `SES_RATE_PER_SEC`만큼 묶어서 발송
-- __멱등성 보장__: `uuid` 기반 TTL 캐시로 중복 메시지 스킵
-- __개별 성공/실패 처리__: 성공 시 ack, 실패 시 지연 NAK로 재시도
-- __Poison 메시지 제거__: 파싱 실패 메시지는 즉시 ack하여 큐 정리
-- __Graceful 종료__: Ctrl+C 시 통계 로그 후 종료
-- __관찰성__: `tracing` 기반 로그 (`RUST_LOG`로 제어)
+- **동시성 처리**: 설정 가능한 동시성 제한으로 대량 이메일 처리
+- **속도 제한**: Governor를 사용한 초당 발송량 제어
+- **멱등성 보장**: UUID 기반 캐시로 중복 메시지 방지
+- **신뢰성**: 명시적 ACK/NAK으로 메시지 처리 보장
+- **관찰성**: 실시간 RPS 모니터링 및 구조화된 로깅
 
-## 아키텍처 개요
+## 아키텍처
 
-- 메시지 브로커: NATS JetStream
-- 소비 방식: Pull Consumer (`ack_policy=explicit`, `max_ack_pending` 설정)
-- 메일 발송: AWS SES v2 `SendEmail` (병렬 실행)
-- 언어/런타임: Rust + Tokio
-- 멱등성 캐시: `moka::future::Cache` (TTL 기반)
+```
+NATS JetStream → Pull Consumer → Rate Limiter → AWS SES
+                      ↓
+                Idempotency Cache
+```
+
+- **메시지 브로커**: NATS JetStream (Pull Consumer)
+- **직렬화**: MessagePack (rmp-serde)
+- **이메일 서비스**: AWS SES v2
+- **캐시**: Moka (TTL 기반)
+- **런타임**: Tokio
 
 ## 메시지 형식
 
-NATS 메시지 페이로드(JSON):
-```json
-{
-  "uuid": "a1b2c3d4-...-z9",
-  "email": "user@example.com",
-  "subject": "메일 제목",
-  "body": "<p>HTML 본문 또는 텍스트</p>"
+MessagePack으로 직렬화된 페이로드:
+
+```rust
+struct EmailPayload {
+    uuid: String,        // 멱등성 키
+    email: String,       // 수신자 이메일
+    subject: String,     // 제목
+    body: String,        // HTML 본문
 }
 ```
 
-- __uuid__: 요청 식별자(멱등성 키)
-- __email__: 수신자 이메일
-- __subject__: 제목
-- __body__: HTML 또는 텍스트(현재 코드상 HTML로 전송)
+## 환경 설정
 
-## 환경변수
+| 변수 | 기본값 | 설명 |
+|------|--------|------|
+| `NATS_URL` | `nats://127.0.0.1:4222` | NATS 서버 URL |
+| `STREAM` | `messages` | JetStream 스트림 이름 |
+| `SUBJECT` | `messages.email` | 구독할 주제 |
+| `CONSUMER` | `email-processor` | Durable Consumer 이름 |
+| `SES_RATE_PER_SEC` | `50` | 초당 발송 제한 |
+| `FROM_EMAIL` | `no-reply@localhost` | 발신자 이메일 |
+| `CONCURRENCY_LIMIT` | `500` | 동시 처리 제한 |
 
-[.env.sample](cci:7://file:///Users/jake/dev/projects/messages/services/sender-email/.env.sample:0:0-0:0) 참고:
+AWS 설정:
+- `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
+- `AWS_REGION` (기본: `ap-northeast-2`)
 
-- __NATS_URL__ (기본: `nats://127.0.0.1:4222`)
-- __STREAM__ (기본: `messages`)
-- __SUBJECT__ (기본: `messages.email`)
-- __CONSUMER__ (기본: `email-processor`)
-- __SES_RATE_PER_SEC__ 초당 발송량 제한 (기본: `50`, 샘플: `25`)
-- __FROM_EMAIL__ 발신 주소 (기본: `no-reply@localhost`)
-- __FETCH_TIMEOUT_MS__ Pull fetch 만료(ms) (기본: `100`)
-- __MAX_ACK_PENDING__ JetStream ack 대기 상한 (기본: `1000`)
-- __NAK_DELAY_SECS__ 실패 시 재시도 지연(초) (기본: `10`)
-- __IDEMPOTENCY_WINDOW_SECS__ 멱등성 TTL(초) (기본: `60`)
-- __AWS_ACCESS_KEY_ID__, __AWS_SECRET_ACCESS_KEY__, __AWS_REGION__
-    - 리전 기본값: `ap-northeast-2` (서울). 환경변수가 있으면 이를 우선합니다.
-- 선택: __RUST_LOG__ 예: `info` 또는 `messages_email_sender=debug,aws_smithy_http=warn`
+## 시작하기
 
-## 로컬 실행
+### 1. 환경 설정
 
-1) 의존성 설치
-- Rust 1.89+ (edition 2024)
-- NATS Server (JetStream 활성화)
-- AWS 자격증명 구성(Profile 또는 env)
-
-2) .env 생성
-```
+```bash
+# 환경 변수 파일 생성
 cp .env.sample .env
-# 값 채우기 (특히 AWS 자격증명/리전, FROM_EMAIL)
+# 필요한 값들을 설정하세요 (특히 AWS 자격증명과 FROM_EMAIL)
 ```
 
-3) NATS JetStream 준비(예시)
-- 스트림 생성:
-    - 이름: `messages`
-    - 주제: `messages.email`
-- 컨슈머 생성:
-    - Durable: `email-processor`
-    - 필터 주제: `messages.email`
-    - Ack 정책: explicit
+### 2. 빌드 및 실행
 
-참고: 조직 표준 툴/인프라로 생성해도 됩니다. CLI 예시는 환경에 따라 다를 수 있어 여기서는 개념만 안내합니다.
+```bash
+# 개발 모드
+cargo run
 
-4) 빌드 & 실행
-```
+# 릴리스 빌드
 cargo build --release
 RUST_LOG=info ./target/release/messages-email-sender
 ```
 
-## Docker
+### 3. Docker 실행
 
-- 빌드/실행 스크립트: [run.sh](cci:7://file:///Users/jake/dev/projects/messages/services/sender-email/run.sh:0:0-0:0)
-- 수동 실행:
+```bash
+# 빌드 스크립트 사용
+./run.sh
+
+# 또는 수동 실행
+docker build -t messages-email-sender .
+docker run --env-file .env messages-email-sender
 ```
-docker build -t messages-email-sender:latest .
-docker run --env-file .env --name=messages-email-sender -d messages-email-sender:latest
+
+## 동작 원리
+
+1. **메시지 수신**: NATS JetStream에서 배치 단위로 메시지 가져오기
+2. **동시 처리**: 설정된 동시성 제한 내에서 병렬 처리
+3. **속도 제어**: Governor를 통한 초당 발송량 제한
+4. **멱등성 검사**: UUID 기반 캐시로 중복 메시지 스킵
+5. **이메일 발송**: AWS SES를 통한 개별 이메일 전송
+6. **결과 처리**: 
+   - 성공 시 ACK
+   - 실패 시 5초 지연 후 NAK (재시도)
+   - 파싱 실패 시 즉시 ACK (독성 메시지 제거)
+
+## 모니터링
+
+서비스는 다음과 같은 로그를 제공합니다:
+
+- **시작 로그**: 설정 정보 출력
+- **RPS 로그**: 초당 발송 통계 (`🚀 Sent per second (RPS): N`)
+- **오류 로그**: 발송 실패 및 재시도 정보
+- **디버그 로그**: 개별 메시지 처리 상태
+
+로그 레벨 설정:
+```bash
+RUST_LOG=info                    # 기본 정보
+RUST_LOG=debug                   # 상세 디버그
+RUST_LOG=messages_email_sender=debug,aws=warn  # 선택적 로깅
 ```
-- Dockerfile
-    - 멀티스테이지 빌드: `rust:1.89-slim` → `distroless/cc-debian12`
-    - 실행 사용자: UID 1000
-    - 엔트리포인트: `/app/messages-email-sender`
 
-## 동작 방식 상세
+## 성능 튜닝
 
-- 메인 루프는 정확히 1초 간격으로 동작하며 각 틱에서:
-    - `ses_rate_per_sec`만큼 Pull fetch
-    - JSON 파싱 실패 → 즉시 ack (poison 제거)
-    - 멱등성 캐시 히트 → 즉시 ack (중복 스킵)
-    - 나머지를 AWS SES로 병렬 발송
-        - 성공 → ack
-        - 실패 → `NAK_DELAY_SECS` 지연 NAK로 재시도
-- 장시간 빈 큐면 60틱(분 단위)마다 디버그 로그
-- 종료 시 통계 출력: 총 발송/poison/empty_ticks
+| 설정 | 용도 | 권장값 |
+|------|------|--------|
+| `SES_RATE_PER_SEC` | AWS SES 할당량에 맞춘 속도 제한 | 50-200 |
+| `CONCURRENCY_LIMIT` | 동시 처리 메시지 수 | 100-1000 |
 
-관련 코드:
-- [src/main.rs](cci:7://file:///Users/jake/dev/projects/messages/services/sender-email/src/main.rs:0:0-0:0)의 [process_batch()](cci:1://file:///Users/jake/dev/projects/messages/services/sender-email/src/main.rs:138:0-238:1)와 [send_ses_bulk()](cci:1://file:///Users/jake/dev/projects/messages/services/sender-email/src/main.rs:75:0-136:1) 참고
-- 환경 로드: [AppConfig::from_env()](cci:1://file:///Users/jake/dev/projects/messages/services/sender-email/src/main.rs:44:4-72:5)
+## AWS SES 설정
 
-## 튜닝 포인트
+1. **이메일 인증**: 발신 이메일 주소 또는 도메인 검증
+2. **샌드박스 해제**: 프로덕션 사용을 위한 제한 해제
+3. **IAM 권한**: `ses:SendEmail` 권한 필요
+4. **리전 설정**: 기본 `ap-northeast-2` (서울)
 
-- __SES_RATE_PER_SEC__: 초당 발송량 제한. SES 할당량/스로틀에 맞춰 조정.
-- __FETCH_TIMEOUT_MS__: Pull 대기 시간. 지연과 공회전을 균형 있게.
-- __MAX_ACK_PENDING__: 컨슈머 ack 대기 상한. 처리량/메모리에 맞춰 조정.
-- __NAK_DELAY_SECS__: 실패 재시도 지연. 일시적 오류 완화에 유용.
-- __IDEMPOTENCY_WINDOW_SECS__: 중복 스킵 TTL. 재전송 패턴에 맞춰 조정.
+## 의존성
 
-## AWS SES 요건
-
-- 발신 도메인/이메일 인증(검증) 필요
-- 프로덕션 전환/할당량 확보
-- IAM 권한: SESv2 `SendEmail` 등
-- 리전: 기본 `ap-northeast-2`, 환경변수로 오버라이드 가능
-
-## 로깅/관찰성
-
-- `tracing` 사용. `RUST_LOG`로 레벨 제어
-- 주요 로그:
-    - 시작/설정 요약
-    - 배치 결과(성공/poison/중복)
-    - SES 실패 및 NAK 처리
-    - 종료 통계
-
-## 제한 사항
-
-- 템플릿 메일/첨부파일 미지원(단순 본문 발송)
-- 대량 발송 최적화(예: SES Bulk API 템플릿)는 향후 개선 여지
-- 헬스체크/프로메테우스 메트릭 미포함
-
-## 개발
-
-- 의존성: [Cargo.toml](cci:7://file:///Users/jake/dev/projects/messages/services/sender-email/Cargo.toml:0:0-0:0) 참고
-    - async-nats, aws-sdk-sesv2, tokio, tracing, serde, serde_json, anyhow, moka 등
-- 코드 엔트리: [src/main.rs](cci:7://file:///Users/jake/dev/projects/messages/services/sender-email/src/main.rs:0:0-0:0)
-
-## 라이선스
-
-조직 정책을 따릅니다. 별도 라이선스 파일이 있는 경우 이를 우선합니다.
+주요 크레이트:
+- `async-nats`: NATS JetStream 클라이언트
+- `aws-sdk-sesv2`: AWS SES v2 SDK
+- `governor`: 속도 제한
+- `moka`: 고성능 캐시
+- `rmp-serde`: MessagePack 직렬화
+- `tokio`: 비동기 런타임
+- `tracing`: 구조화된 로깅
