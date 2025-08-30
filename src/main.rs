@@ -35,7 +35,7 @@ struct AppConfig {
     stream_name: String,
     subject_filter: String,
     durable_name: String,
-    ses_rate_per_sec: u64,
+    ses_rate_per_sec: u32,
     from_email: String,
     concurrency_limit: usize,
 }
@@ -172,9 +172,11 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Rate Limiter 설정
-    let rate_limiter = Arc::new(RateLimiter::direct(Quota::per_second(
-        NonZeroU32::new(config.ses_rate_per_sec as u32).unwrap_or(NonZeroU32::new(1).unwrap()),
-    )));
+    let lim = RateLimiter::direct(
+        Quota::per_second(NonZeroU32::new(config.ses_rate_per_sec).unwrap())
+            .allow_burst(NonZeroU32::new(config.ses_rate_per_sec).unwrap())
+    );
+    let rate_limiter = Arc::new(lim);
 
     info!(
         "NATS JetStream에서 메시지 컨슈밍 시작... (동시성: {}, 비율: {} RPS)",

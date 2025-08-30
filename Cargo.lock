@@ -1696,7 +1696,6 @@ dependencies = [
  "moka",
  "rmp-serde",
  "serde",
- "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
