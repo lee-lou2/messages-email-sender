@@ -174,7 +174,7 @@ async fn main() -> anyhow::Result<()> {
     // Rate Limiter 설정
     let lim = RateLimiter::direct(
         Quota::per_second(NonZeroU32::new(config.ses_rate_per_sec).unwrap())
-            .allow_burst(NonZeroU32::new(config.ses_rate_per_sec).unwrap())
+            .allow_burst(NonZeroU32::new(1).unwrap())
     );
     let rate_limiter = Arc::new(lim);
 
