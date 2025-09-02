@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use async_nats::jetstream;
 use async_nats::jetstream::consumer::{AckPolicy, Consumer, pull::Config as PullConfig};
-use async_nats::jetstream::message::{AckKind, Message};
+use async_nats::jetstream::message::AckKind;
 use async_nats::jetstream::stream::Config as StreamConfig;
 use futures::StreamExt;
 use governor::{Quota, RateLimiter};
@@ -64,53 +64,32 @@ impl AppConfig {
 // 개별 이메일을 AWS SES를 통해 발송하는 로직 (기존과 거의 동일)
 async fn send_single_email(
     ses_client: Arc<SesClient>,
-    nats_msg: Message,
     payload: EmailPayload,
     config: Arc<AppConfig>,
-    sent_count: Arc<AtomicUsize>,
-) {
+) -> anyhow::Result<()> {
     // SES 메시지 구성
     let destination = Destination::builder().to_addresses(&payload.email).build();
     let subject = Content::builder()
         .data(&payload.subject)
         .charset("UTF-8")
-        .build()
-        .unwrap();
+        .build()?;
     let body_html = Content::builder()
         .data(&payload.body)
         .charset("UTF-8")
-        .build()
-        .unwrap();
+        .build()?;
     let body = Body::builder().html(body_html).build();
     let ses_message = SesMessage::builder().subject(subject).body(body).build();
     let email_content = EmailContent::builder().simple(ses_message).build();
 
     // 이메일 발송
-    match ses_client
+    ses_client
         .send_email()
         .from_email_address(&config.from_email)
         .destination(destination)
         .content(email_content)
         .send()
-        .await
-    {
-        Ok(_) => {
-            sent_count.fetch_add(1, Ordering::Relaxed);
-            debug!("Email sent to {}", payload.email);
-            if let Err(e) = nats_msg.ack().await {
-                error!("메시지 ACK 실패 ({}): {}", payload.email, e);
-            }
-        }
-        Err(e) => {
-            error!("이메일 발송 실패 ({}): {}", payload.email, e);
-            if let Err(e) = nats_msg
-                .ack_with(AckKind::Nak(Some(Duration::from_secs(5))))
-                .await
-            {
-                error!("메시지 NAK 실패 ({}): {}", payload.email, e);
-            }
-        }
-    }
+        .await?;
+    Ok(())
 }
 
 #[tokio::main]
@@ -174,7 +153,7 @@ async fn main() -> anyhow::Result<()> {
     // Rate Limiter 설정
     let lim = RateLimiter::direct(
         Quota::per_second(NonZeroU32::new(config.ses_rate_per_sec).unwrap())
-            .allow_burst(NonZeroU32::new(1).unwrap())
+            .allow_burst(NonZeroU32::new(1).unwrap()),
     );
     let rate_limiter = Arc::new(lim);
 
@@ -236,7 +215,27 @@ async fn main() -> anyhow::Result<()> {
                     limiter.until_ready().await;
 
                     // 메시지 발송
-                    tokio::spawn(send_single_email(client, nats_msg, payload, conf, counter));
+                    let recipient = payload.email.clone();
+                    match send_single_email(client, payload, conf).await {
+                        Ok(_) => {
+                            debug!("이메일 발송 성공: {}", recipient);
+                            counter.fetch_add(1, Ordering::Relaxed);
+                            let _ = nats_msg.ack().await;
+                        }
+                        Err(e) => {
+                            if e.to_string().contains("Throttling") {
+                                error!("SES 쓰로틀링 에러 발생, 메시지를 NACK 처리하여 재시도합니다: {}", e);
+                                if let Err(e) = nats_msg
+                                    .ack_with(AckKind::Nak(Some(Duration::from_secs(5))))
+                                    .await {
+                                    error!("NACK 처리 실패: {}", e);
+                                }
+                                return;
+                            }
+                            error!("이메일 발송 실패 ({}): {}", recipient, e);
+                            let _ = nats_msg.ack().await;
+                        }
+                    }
                 }
             })
             .await;
